@@ -67,15 +67,13 @@ The following picture shows the architecture design of the test application.
 <br/>
 
 # Message Flow #
-- The following tasks try to acquire an exclusive lock on the same ResourceMutextActor with Id equal to "SharedResource":
+The following tasks try to acquire an exclusive lock on the same ResourceMutextActor with Id equal to "SharedResource":
 
-	- **TestStatefulService**: it's a reliable stateful service running in the same Service Fabric application. 
-	- **TestStatelessService**: it's a reliable stateless service running in the same Service Fabric application.
-	- **TestClient**: it's a console application playing the role of an external application that tries to acquire an exclusive lock on the resource protected by the actor by invoking its methods via the gateway service.
+- **TestStatefulService**: it's a reliable stateful service running in the same Service Fabric application. 
+- **TestStatelessService**: it's a reliable stateless service running in the same Service Fabric application.
+- **TestClient**: it's a console application playing the role of an external application that tries to acquire an exclusive lock on the resource protected by the actor by invoking its methods via the gateway service.
 
-- The Gateway Service is a stateless service running an ASP.NET Web API REST service hosted by OWIN that can be used by external applications to interact with ResourceMutexActor entities via HTTP.  
-
-Each service tries to acquire a lock on the same ResourceMutexActor. When it acquires the lease, it becomes the leader and keeps renewing the lease on the actor for a configurable amount of steps. Then, the leader simulates a down or it explictly releases the lease on the actor. In any case, the leader will lose the lease, and another task will be able to acquire it. In fact, whn the leader keeps renewing the lease, the other services try to acquire the lease in a loop. Note: the implementation of the ResourceMutexActor class uses a reminder to check if the leader has renewed the lease on time, otherwise the reminder releases the lease.
+The Gateway Service is a stateless service running an ASP.NET Web API REST service hosted by OWIN that can be used by external applications to interact with ResourceMutexActor entities via HTTP. Each service tries to acquire a lock on the same ResourceMutexActor. When it acquires the lease, it becomes the leader and keeps renewing the lease on the actor for a configurable amount of steps. Then, the leader simulates a down or it explictly releases the lease on the actor. In any case, the leader will lose the lease, and another task will be able to acquire it. In fact, whn the leader keeps renewing the lease, the other services try to acquire the lease in a loop. Note: the implementation of the ResourceMutexActor class uses a reminder to check if the leader has renewed the lease on time, otherwise the reminder releases the lease.
 
 # Code #
 The following table show the code of the ResourceMutexActor class:
@@ -156,12 +154,14 @@ namespace Microsoft.AzureCat.Samples.ResourceMutexActorService
                 // Validate parameter
                 if (string.IsNullOrWhiteSpace(requesterId))
                 {
-                    throw new ArgumentNullException(nameof(requesterId), "requesterId argument cannot be null or empty.");
+                    throw new ArgumentNullException(nameof(requesterId), 
+						"requesterId argument cannot be null or empty.");
                 }
 
                 if (leaseInterval.TotalSeconds <= 0)
                 {
-                    throw new ArgumentException("leaseInterval cannot be less or equal to zero.", nameof(leaseInterval));
+                    throw new ArgumentException("leaseInterval cannot be less or equal to zero.", 
+					nameof(leaseInterval));
                 }
 
                 var result = await StateManager.TryGetStateAsync<string>(LeaderIdState);
@@ -170,12 +170,16 @@ namespace Microsoft.AzureCat.Samples.ResourceMutexActorService
                 {
                     if (!string.IsNullOrWhiteSpace(result.Value))
                     {
-                        // The resource is already acquired. Return true if requesterId == leaderId, false otherwise
-                        if (string.Compare(requesterId, result.Value, StringComparison.InvariantCultureIgnoreCase) == 0)
+                        // The resource is already acquired. 
+						// Return true if requesterId == leaderId, false otherwise
+                        if (string.Compare(requesterId, 
+										   result.Value, 
+											StringComparison.InvariantCultureIgnoreCase) == 0)
                         {
                             // The acquire lease operation is idempotent. Add or update the leaseInterval and leaseDateTime states.
                             now = DateTime.UtcNow;
-                            await StateManager.AddOrUpdateStateAsync(LeaseIntervalState, leaseInterval, (k, v) => leaseInterval);
+                            await StateManager.AddOrUpdateStateAsync(LeaseIntervalState, 
+									leaseInterval, (k, v) => leaseInterval);
                             await StateManager.AddOrUpdateStateAsync(LeaseDateTimeState, now, (k, v) => now);
 
                             // Register a one-shot reminder
@@ -435,64 +439,68 @@ namespace Microsoft.AzureCat.Samples.ResourceMutexActorService
 The following table contains the code executed by both the stateless and stateful services inside the RunAsync method to acquire, renew and release the lease on the ResourceMutexActor.
 
 ```CSharp
+/// <summary>
+/// This is the main entry point for your service instance.
+/// </summary>
+/// <param name="cancellationToken">Canceled when Service Fabric needs to shut down this service instance.</param>
 protected override async Task RunAsync(CancellationToken cancellationToken)
+{
+  while (true)
+  {
+    cancellationToken.ThrowIfCancellationRequested();
+    var actorProxy = ActorProxy.Create<IResourceMutexActor>(new ActorId(ResourceId),
+                                new Uri(resourceMutextActorServiceUri));
+    if (actorProxy != null)
+    {
+      // Create the requesterId
+      var requesterId = $"{Context.ReplicaOrInstanceId}";
+
+      var ok = await actorProxy.AcquireLeaseAsync(requesterId, leaseInterval);
+      if (ok)
+      {
+        ServiceEventSource.Current.Message($"Requester [{requesterId}] acquired a lease on [{ResourceId}] acquired. StepCount=[{stepCount}]");
+        for (var i = 0; i < stepCount; i++)
         {
-            while (true)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var actorProxy = ActorProxy.Create<IResourceMutexActor>(new ActorId(ResourceId),
-                                                                        new Uri(resourceMutextActorServiceUri));
-                if (actorProxy != null)
-                {
-                    // Create the requesterId
-                    var requesterId = $"{Context.ReplicaOrInstanceId}";
+          var step = i + 1;
+          ServiceEventSource.Current.Message($"Requester [{requesterId}] is waiting [{renewInterval.Seconds}] seconds before renewing the lease on [{ResourceId}]. Step [{step}] of [{stepCount}]...");
+          // Wait for time period equal to renewInterval parameter
+          await Task.Delay(renewInterval, cancellationToken);
 
-                    var ok = await actorProxy.AcquireLeaseAsync(requesterId, leaseInterval);
-                    if (ok)
-                    {
-                        ServiceEventSource.Current.Message($"Requester [{requesterId}] acquired a lease on [{ResourceId}] acquired. StepCount=[{stepCount}]");
-                        for (var i = 0; i < stepCount; i++)
-                        {
-                            var step = i + 1;
-                            ServiceEventSource.Current.Message($"Requester [{requesterId}] is waiting [{renewInterval.Seconds}] seconds before renewing the lease on [{ResourceId}]. Step [{step}] of [{stepCount}]...");
-                            // Wait for time period equal to renewInterval parameter
-                            await Task.Delay(renewInterval, cancellationToken);
-
-                            // Renew the lease
-                            ServiceEventSource.Current.Message($"Requester [{requesterId}] renewing the lease on [{ResourceId}]. Step [{step}] of [{stepCount}]...");
-                            await actorProxy.RenewLeaseAsync(requesterId, leaseInterval);
-                            ServiceEventSource.Current.Message($"Requester [{requesterId}] successfully renewed the lease on [{ResourceId}]. Step [{step}] of [{stepCount}].");
-                        }
-
-                        // Simulate a down or mutex release
-                        var random = new Random();
-                        var value = random.Next(1, 3);
-                        if (value == 1)
-                        {
-                            // Simulate a down period
-                            ServiceEventSource.Current.Message($"Requester [{requesterId}] simulating a down of [{downInterval.Seconds}] seconds...");
-                            await Task.Delay(downInterval, cancellationToken);
-                        }
-                        else
-                        {
-                            // Release the mutex lease
-                            ServiceEventSource.Current.Message($"Requester [{requesterId}] releasing the lease on [{ResourceId}]...");
-                            await actorProxy.ReleaseLeaseAsync(requesterId);
-                            ServiceEventSource.Current.Message($"Requester [{requesterId}] successfully released the lease on [{ResourceId}]");
-                        }
-                    }
-                    
-                    // Wait before retrying to acquire the lease
-                    ServiceEventSource.Current.Message($"Requester [{requesterId}] is waiting [{acquireInterval.Seconds}] seconds before retrying to acquire a lease on [{ResourceId}]...");
-                    await Task.Delay(acquireInterval, cancellationToken);
-                }
-                else
-                {
-                    throw new ApplicationException($"The ActorProxy cannot be null. ResourceId=[{ResourceId}] ResourceMutextActorServiceUri=[{resourceMutextActorServiceUri}]");
-                }
-            }
-            // ReSharper disable once FunctionNeverReturns
+          // Renew the lease
+          ServiceEventSource.Current.Message($"Requester [{requesterId}] renewing the lease on [{ResourceId}]. Step [{step}] of [{stepCount}]...");
+          await actorProxy.RenewLeaseAsync(requesterId, leaseInterval);
+          ServiceEventSource.Current.Message($"Requester [{requesterId}] successfully renewed the lease on [{ResourceId}]. Step [{step}] of [{stepCount}].");
         }
+
+        // Simulate a down or mutex release
+        var random = new Random();
+        var value = random.Next(1, 3);
+        if (value == 1)
+        {
+          // Simulate a down period
+          ServiceEventSource.Current.Message($"Requester [{requesterId}] simulating a down of [{downInterval.Seconds}] seconds...");
+          await Task.Delay(downInterval, cancellationToken);
+        }
+        else
+        {
+          // Release the mutex lease
+          ServiceEventSource.Current.Message($"Requester [{requesterId}] releasing the lease on [{ResourceId}]...");
+          await actorProxy.ReleaseLeaseAsync(requesterId);
+          ServiceEventSource.Current.Message($"Requester [{requesterId}] successfully released the lease on [{ResourceId}]");
+        }
+      }
+          
+      // Wait before retrying to acquire the lease
+      ServiceEventSource.Current.Message($"Requester [{requesterId}] is waiting [{acquireInterval.Seconds}] seconds before retrying to acquire a lease on [{ResourceId}]...");
+      await Task.Delay(acquireInterval, cancellationToken);
+    }
+    else
+    {
+      throw new ApplicationException($"The ActorProxy cannot be null. ResourceId=[{ResourceId}] ResourceMutextActorServiceUri=[{resourceMutextActorServiceUri}]");
+    }
+  }
+  // ReSharper disable once FunctionNeverReturns
+} 
 ```
 
 # Configuration Files #
@@ -562,7 +570,11 @@ protected override async Task RunAsync(CancellationToken cancellationToken)
 
 ```xml
     <?xml version="1.0" encoding="utf-8"?>
-	<ApplicationManifest xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ApplicationTypeName="LeaderElectionType" ApplicationTypeVersion="1.0.0" xmlns="http://schemas.microsoft.com/2011/01/fabric">
+	<ApplicationManifest xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+						 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+						 ApplicationTypeName="LeaderElectionType" 
+						 ApplicationTypeVersion="1.0.0" 
+						 xmlns="http://schemas.microsoft.com/2011/01/fabric">
 	  <Parameters>
 	    <Parameter Name="GatewayService_InstanceCount" DefaultValue="-1" />
 	    <Parameter Name="GatewayService_ResourceMutexActorServiceUri" DefaultValue="" />
@@ -609,12 +621,14 @@ protected override async Task RunAsync(CancellationToken cancellationToken)
 	    </ConfigOverrides>
 	  </ServiceManifestImport>
 	  <ServiceManifestImport>
-	    <ServiceManifestRef ServiceManifestName="TestStatefulServicePkg" ServiceManifestVersion="1.0.0" />
+	    <ServiceManifestRef ServiceManifestName="TestStatefulServicePkg" 
+							ServiceManifestVersion="1.0.0" />
 	    <ConfigOverrides>
 	      <ConfigOverride Name="Config">
 	        <Settings>
 	          <Section Name="ServiceConfig">
-	            <Parameter Name="ResourceMutexActorServiceUri" Value="[TestStatefulService_ResourceMutexActorServiceUri]" />
+	            <Parameter Name="ResourceMutexActorServiceUri" 
+						   Value="[TestStatefulService_ResourceMutexActorServiceUri]" />
 	            <Parameter Name="StepCount" 
 						   Value="[TestStatefulService_StepCount]" />
 	            <Parameter Name="AcquireIntervalParameter" 
@@ -631,14 +645,18 @@ protected override async Task RunAsync(CancellationToken cancellationToken)
 	    </ConfigOverrides>
 	  </ServiceManifestImport>
 	  <ServiceManifestImport>
-	    <ServiceManifestRef ServiceManifestName="TestStatelessServicePkg" ServiceManifestVersion="1.0.0" />
+	    <ServiceManifestRef ServiceManifestName="TestStatelessServicePkg" 
+						    ServiceManifestVersion="1.0.0" />
 	    <ConfigOverrides>
 	      <ConfigOverride Name="Config">
 	        <Settings>
 	          <Section Name="ServiceConfig">
-	            <Parameter Name="ResourceMutexActorServiceUri" Value="[TestStatelessService_ResourceMutexActorServiceUri]" />
-	            <Parameter Name="StepCount" Value="[TestStatelessService_StepCount]" />
-	            <Parameter Name="AcquireIntervalParameter" Value="[TestStatelessService_AcquireIntervalParameter]" />
+	            <Parameter Name="ResourceMutexActorServiceUri" 
+						   Value="[TestStatelessService_ResourceMutexActorServiceUri]" />
+	            <Parameter Name="StepCount" 
+						   Value="[TestStatelessService_StepCount]" />
+	            <Parameter Name="AcquireIntervalParameter" 
+						   Value="[TestStatelessService_AcquireIntervalParameter]" />
 	            <Parameter Name="RenewIntervalParameter" 
 						   Value="[TestStatelessService_RenewIntervalParameter]" />
 	            <Parameter Name="LeaseIntervalParameter" 
@@ -652,12 +670,13 @@ protected override async Task RunAsync(CancellationToken cancellationToken)
 	  </ServiceManifestImport>
 	  <DefaultServices>
 	    <!-- The section below creates instances of service types, when an instance of this 
-	         application type is created. You can also create one or more instances of service type using the 
-	         ServiceFabric PowerShell module.
-	         
-	         The attribute ServiceTypeName below must match the name defined in the imported ServiceManifest.xml file. -->
+	         application type is created. You can also create one or more instances 
+			 of service type using the ServiceFabric PowerShell module.
+	         The attribute ServiceTypeName below must match the name 
+			 defined in the imported ServiceManifest.xml file. -->
 	    <Service Name="GatewayService">
-	      <StatelessService ServiceTypeName="GatewayServiceType" InstanceCount="[GatewayService_InstanceCount]">
+	      <StatelessService ServiceTypeName="GatewayServiceType" 
+							InstanceCount="[GatewayService_InstanceCount]">
 	        <SingletonPartition />
 	      </StatelessService>
 	    </Service>
@@ -665,7 +684,9 @@ protected override async Task RunAsync(CancellationToken cancellationToken)
 	      <StatefulService ServiceTypeName="TestStatefulServiceType" 
 						   TargetReplicaSetSize="[TestStatefulService_TargetReplicaSetSize]"
 						   MinReplicaSetSize="[TestStatefulService_MinReplicaSetSize]">
-	        <UniformInt64Partition PartitionCount="[TestStatefulService_PartitionCount]" LowKey="-9223372036854775808" HighKey="9223372036854775807" />
+	        <UniformInt64Partition PartitionCount="[TestStatefulService_PartitionCount]" 
+								   LowKey="-9223372036854775808" 
+								   HighKey="9223372036854775807" />
 	      </StatefulService>
 	    </Service>
 	    <Service Name="TestStatelessService">
@@ -679,7 +700,9 @@ protected override async Task RunAsync(CancellationToken cancellationToken)
 	      <StatefulService ServiceTypeName="ResourceMutexActorServiceType" 
 						   TargetReplicaSetSize="[ResourceMutexActorService_TargetReplicaSetSize]" 
 						   MinReplicaSetSize="[ResourceMutexActorService_MinReplicaSetSize]">
-	        <UniformInt64Partition PartitionCount="[ResourceMutexActorService_PartitionCount]" LowKey="-9223372036854775808" HighKey="9223372036854775807" />
+	        <UniformInt64Partition PartitionCount="[ResourceMutexActorService_PartitionCount]" 
+								   LowKey="-9223372036854775808" 
+								   HighKey="9223372036854775807" />
 	      </StatefulService>
 	    </Service>
 	  </DefaultServices>

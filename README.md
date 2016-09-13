@@ -60,90 +60,460 @@ This demo uses the turn-based model for invoking methods to implement an exclusi
 
 
 # Architecture Design #
-The following picture shows the architecture design of the application.
+The following picture shows the architecture design of the test application.
 <br/>
 <br/>
-![alt tag](https://raw.githubusercontent.com/paolosalvatori/servicefabricclickanalytics/master/Images/Architecture.png)
+![alt tag](https://raw.githubusercontent.com/paolosalvatori/ServiceFabricLeaderElection/master/Images/Architecture.png)
 <br/>
 
 # Message Flow #
-1. A Windows Forms application is used to emulate a configurable amount of users sending events to the ingestion pipeline of the click analytics system.</br/>
-![alt tag](https://raw.githubusercontent.com/paolosalvatori/servicefabricclickanalytics/master/Images/Client.png)
-<br/>
-The client application uses a separate Task to emulate each user. Each user session is composed by a series of JSON messages sent to the service endpoint of the click analytics ingestion pipeline:
-	- a special	session start event
-	- a configurable amount of user events (click, mouse move, enter text)
-	- a special session stop event
-2. The **PageViewtWebService** stateless service receives requests using the **POST** method. The body of the request is in **JSON** format, the **Content-Type** header is equal to application/json, while the custom userId header contains the user id. The payload contains the **userId** (cross check) and the **User Event**. The service writes events into an **Event Hub**. The **userId** is used as a value for the [EventData.PartitionKey](https://msdn.microsoft.com/en-us/library/microsoft.servicebus.messaging.eventdata.partitionkey.aspx) property. The **userid** is also stored in a custom **userId** property, while the **eventType** (start session, user event, stop session) is stored in another custom property of the [EventData](https://msdn.microsoft.com/en-us/library/microsoft.servicebus.messaging.eventdata.aspx) message. Note: this microservice uses a pool of [EventHubClient](https://msdn.microsoft.com/library/azure/microsoft.servicebus.messaging.eventhubclient.aspx) objects to increase the throughput of the ingestion pipeline.
-3. The **EventProcessorHostService** uses an **EventProcessorHost** listener to receive messages from the **Event Hub**.
-4. The **EventProcessorHostService** retrieves the **userId** and **eventType** from the [Properties](https://msdn.microsoft.com/en-us/library/microsoft.servicebus.messaging.eventdata.properties.aspx) collection of the [EventData](https://msdn.microsoft.com/en-us/library/microsoft.servicebus.messaging.eventdata.aspx) message and the payload from the message body, and uses a [CloudAppendBlob](https://msdn.microsoft.com/en-us/library/microsoft.windowsazure.storage.blob.cloudappendblob.aspx) object to write the event to a [Append Blob](https://azure.microsoft.com/en-us/documentation/articles/storage-dotnet-how-to-use-blobs/) inside a given storage container. <br/> The name is of the blob is **{userId}_{session_start_timestamp}.log**. <br/><br/>![alt tag](https://raw.githubusercontent.com/paolosalvatori/servicefabricclickanalytics/master/Images/Blobs.png)<br/>
-<br/> When the it receives a stop session event, the microservice sends a **JSON** message to **Service Bus Queue**. The message contains the  **userId** and **uri** of the [Append Blob](https://azure.microsoft.com/en-us/documentation/articles/storage-dotnet-how-to-use-blobs/) containing the events of the user visit. The message is received and processed by an external hot path analytics system. You can use the [Service Bus Explorer](https://github.com/paolosalvatori/ServiceBusExplorer) to read messages from the **Service Bus Queue**, as shown in the following picture. <br/><br/>
-![alt tag](https://raw.githubusercontent.com/paolosalvatori/servicefabricclickanalytics/master/Images/QueueMessage.png)
-<br/><br/>To monitor the message flow in real-time, you can create a test **Consumer Group** other than the one used by the application, and use the aaaaaaaa to create and run a **Consumer Group Listener**, as shown in the following picture.<br/><br/>
-![alt tag](https://raw.githubusercontent.com/paolosalvatori/servicefabricclickanalytics/master/Images/EventHub.png)
-<br/><br/>Each **Append Blob** contains all the user events in **JSON** format tracked during the user session: <br/><br/>
-![alt tag](https://raw.githubusercontent.com/paolosalvatori/servicefabricclickanalytics/master/Images/BlobContent.png)
-<br/>
+- The following tasks try to acquire an exclusive lock on the same ResourceMutextActor with Id equal to "SharedResource":
 
-# Service Fabric Application #
-The Service Fabric application ingest events from the input Event Hub, processes sensor readings and generates an alert whenever a value outside of the tolerance range is received. The application is composed of three services:
+	- **TestStatefulService**: it's a reliable stateful service running in the same Service Fabric application. 
+	- **TestStatelessService**: it's a reliable stateless service running in the same Service Fabric application.
+	- **TestClient**: it's a console application playing the role of an external application that tries to acquire an exclusive lock on the resource protected by the actor by invoking its methods via the gateway service.
 
-- **PageViewWebService**: this is a stateless service hosting **OWIN** and exposing a REST ingestion service. The service has been implemented using an **ASP.NET Web API** REST service. The service is implemented as an **ApiController** that exposes a **POST** method invoked by client-side scripts. The service uses a pool of **EventHubClient** objects to increase the performance. Each **EventHubClient** object is cached in a static list and uses an **AMQP** session to send events into the **Event Hub**.
-- **EventProcessorHostService**: this is a stateless service that creates an **EventProcessorHost** listener to receive messages from the event hub. Note: to maximize the throughput, make sure that the number of service instances and cluster nodes matches the number of event hub partitions. The **ProcessEventsAsync** method of the **EventProcessor** class creates and caches a [CloudAppendBlob](https://msdn.microsoft.com/en-us/library/microsoft.windowsazure.storage.blob.cloudappendblob.aspx) object to write the event to a [Append Blob](https://azure.microsoft.com/en-us/documentation/articles/storage-dotnet-how-to-use-blobs/) object, for each user session, to write page views to append blobs.
+- The Gateway Service is a stateless service running an ASP.NET Web API REST service hosted by OWIN that can be used by external applications to interact with ResourceMutexActor entities via HTTP.  
 
-**Note**: one of the advantages of stateless services over stateful services is that by specifying **InstanceCount="-1"** in the **ApplicationManifest.xml**, you can create an instance of the service on each node of the Service Fabric cluster. When the cluster uses [Virtual Machine Scale Sets](https://azure.microsoft.com/en-gb/documentation/articles/virtual-machines-vmss-overview/) to to scale up and down the number of cluster nodes, this allows to automatically scale up and scale down the number of instances of a stateless service based on the autoscaling rules and traffic conditions.
+Each service tries to acquire a lock on the same ResourceMutexActor. When it acquires the lease, it becomes the leader and keeps renewing the lease on the actor for a configurable amount of steps. Then, the leader simulates a down or it explictly releases the lease on the actor. In any case, the leader will lose the lease, and another task will be able to acquire it. In fact, whn the leader keeps renewing the lease, the other services try to acquire the lease in a loop. Note: the implementation of the ResourceMutexActor class uses a reminder to check if the leader has renewed the lease on time, otherwise the reminder releases the lease.
 
-# Recommendations #
-In order to maximize the throughput of the demo, put in practice the following recommendations:
+# Code #
+The following table show the code of the ResourceMutexActor class:
 
-- Deploy the **Service Fabric** application on a cluster with at least 16 nodes
-- Make sure to create an **Event Hub** with a sufficient number of partitions (for example, 16) in a dedicated Service Bus namespace with no other **Event Hubs** and increase the number to **Throughput Units** to be equal to the number of partitions of the **Event Hub**, at least for the duration of the load tests
-- Modify the code to write **Append Blobs** to a pool of **Storage Accounts** instead of a single **Storage Account** as in the current implementation
-- Deploy the **Service Fabric** services with the **InstanceCount** attribute equal to -1
-- Repeat the test when the **Service Fabric** cluster will support **Virtual Machines Scale Sets**
-- Make sure to properly configure **Visual Studio Load Test** to generate enough traffic against the Azure-hosted application. Consider using multiple instances of the Load Test running on multiple Azure subscriptions.
 
-# Application Configuration #
-Make sure to replace the following placeholders in the project files below before deploying and testing the application on the local development Service Fabric cluster or before deploying the application to your Service Fabric cluster on Microsoft Azure.
+```CSharp
+#region Using Directives
 
-## Placeholders ##
-This list contains the placeholders that need to be replaced before deploying and running the application:
+using System;
+using System.Fabric;
+using System.Threading.Tasks;
+using Microsoft.ServiceFabric.Actors.Runtime;
+using Microsoft.AzureCat.Samples.ResourceMutexActorService.Interfaces;
 
-- **[ServiceBusConnectionString]**: defines the connection string of the **Service Bus** namespace that contains the **Event Hub** and **Queue** used by the solution.
-- **[StorageAccountConnectionString]**: contains the connection string of the **Storage Account** used by the **EventProcessorHost** to store partition lease information when reading data from the input **Event Hub**.
-- **[EventHubName]**: contains the name of the input **Event Hub**.
-- **[ConsumerGroupName]**: contains the name of the **Consumer Group** used by the **EventProcessorHost** to read data from the input **Event Hub**.
-- **[ContainerName]**: defines the name of the **Storage Container** where the **EventProcessorHost** writes **Append Blobs**.
-- **[QueueName]**: contains the name of the **Service Bus Queue** used by the **EventProcessorHost** send a message to the external hot path analytics system when user session completes.
-- **[CheckpointCount]**: this number defines after how many messages the **EventProcessorHost** invokes the **ChechpointAsync** method.
-- **[EventHubClientNumber]**: this number defines how many [EventHubClient](https://msdn.microsoft.com/library/azure/microsoft.servicebus.messaging.eventhubclient.aspx) objects are contained in the connection pool of the **PageViewWebService**.
+#endregion
 
-## Configuration Files ##
+namespace Microsoft.AzureCat.Samples.ResourceMutexActorService
+{
+    /// <remarks>
+    /// This class represents an actor.
+    /// Every ActorID maps to an instance of this class.
+    /// The StatePersistence attribute determines persistence and replication of actor state:
+    ///  - Persisted: State is written to disk and replicated.
+    ///  - Volatile: State is kept in memory only and replicated.
+    ///  - None: State is kept in memory only and not replicated.
+    /// </remarks>
+    [ActorService(Name = "ResourceMutexActorService")]
+    [StatePersistence(StatePersistence.Persisted)]
+    internal class ResourceMutexActor : Actor, IRemindable, IResourceMutexActor
+    {
+        #region Private Constants
+
+        //************************************
+        // Actor States
+        //************************************
+        private const string LeaderIdState = "leaderId";
+        private const string LeaseIntervalState = "leaseInterval";
+        private const string LeaseDateTimeState = "leaseDateTime";
+
+        //************************************
+        // Reminders
+        //************************************
+        private const string ReleaseResourceMutexReminder = "releaseReminder";
+
+        #endregion
+
+        #region Private Fields
+        private int maxRetryCount = 3;
+        #endregion
+
+        #region Actor Overridden Methods
+
+        /// <summary>
+        /// This method is called whenever an actor is activated.
+        /// An actor is activated the first time any of its methods are invoked.
+        /// </summary>
+        protected override Task OnActivateAsync()
+        {
+            ActorEventSource.Current.ActorMessage(this, $"ResourceMutexActor [{Id}] Activated");
+            return Task.FromResult(0);
+        }
+        #endregion
+
+        #region IResourceMutexActor Methods
+        /// <summary>
+        /// Initiates an asynchronous operation to acquire the lease on 
+        /// a mutex that governs the exclusive access to a resource.
+        /// </summary>
+        /// <param name="requesterId">The requester Id.</param>
+        /// <param name="leaseInterval">Interval for which the lease is taken on the resource protected by the mutex. 
+        /// If the lease is not renewed within this interval, it will cause it to expire and ownership of the resource 
+        /// will move to another instance.</param>
+        /// <returns>Returns true is the operation succeeds, false otherwise</returns>
+        public async Task<bool> AcquireLeaseAsync(string requesterId, TimeSpan leaseInterval)
+        {
+            try
+            {
+                // Validate parameter
+                if (string.IsNullOrWhiteSpace(requesterId))
+                {
+                    throw new ArgumentNullException(nameof(requesterId), "requesterId argument cannot be null or empty.");
+                }
+
+                if (leaseInterval.TotalSeconds <= 0)
+                {
+                    throw new ArgumentException("leaseInterval cannot be less or equal to zero.", nameof(leaseInterval));
+                }
+
+                var result = await StateManager.TryGetStateAsync<string>(LeaderIdState);
+                DateTime now;
+                if (result.HasValue)
+                {
+                    if (!string.IsNullOrWhiteSpace(result.Value))
+                    {
+                        // The resource is already acquired. Return true if requesterId == leaderId, false otherwise
+                        if (string.Compare(requesterId, result.Value, StringComparison.InvariantCultureIgnoreCase) == 0)
+                        {
+                            // The acquire lease operation is idempotent. Add or update the leaseInterval and leaseDateTime states.
+                            now = DateTime.UtcNow;
+                            await StateManager.AddOrUpdateStateAsync(LeaseIntervalState, leaseInterval, (k, v) => leaseInterval);
+                            await StateManager.AddOrUpdateStateAsync(LeaseDateTimeState, now, (k, v) => now);
+
+                            // Register a one-shot reminder
+                            for (var i = 0; i < maxRetryCount; i++)
+                            {
+                                try
+                                {
+                                    await RegisterReminderAsync(ReleaseResourceMutexReminder,
+                                                                null,
+                                                                leaseInterval,
+                                                                TimeSpan.FromMilliseconds(-1));
+                                }
+                                catch (FabricTransientException)
+                                {
+                                }
+                            }
+
+                            ActorEventSource.Current.Message($"Operation succeeded. Resource=[{Id}] RequesterId=[{requesterId}] LeaderId=[{result.Value}]");
+                            return true;
+                        }
+
+                        // The resource mutex cannot be acquired by a requester other than the existing leader
+                        ActorEventSource.Current.Message($"Operation failed. Resource=[{Id}] RequesterId=[{requesterId}] LeaderId=[{result.Value}]");
+                        return false;
+                    }
+                }
+                
+                // The resource is not acquired yet. Save leaderId == requesterId and return true.
+                await StateManager.AddOrUpdateStateAsync(LeaderIdState, requesterId, (k, v) => requesterId);
+
+                // Add or update the leaseInterval and leaseDateTime states.
+                
+                await StateManager.AddOrUpdateStateAsync(LeaseIntervalState, leaseInterval, (k, v) => leaseInterval);
+                now = DateTime.UtcNow;
+                await StateManager.AddOrUpdateStateAsync(LeaseDateTimeState, now, (k, v) => now);
+
+                // Register a one-shot reminder
+                for (var i = 0; i < maxRetryCount; i++)
+                {
+                    try
+                    {
+                            await RegisterReminderAsync(ReleaseResourceMutexReminder,
+                                                        null,
+                                                        leaseInterval,
+                                                        TimeSpan.FromMilliseconds(-1));
+                    }
+                    catch (FabricTransientException)
+                    {
+                    }
+                }
+
+                ActorEventSource.Current.Message($"Operation succeeded. Resource=[{Id}] RequesterId=[{requesterId}] LeaderId=[NULL]");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                ActorEventSource.Current.Error(ex);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Initiates an asynchronous operation to renew the lease on 
+        /// a mutex that governs the exclusive access to a resource.
+        /// </summary>
+        /// <param name="requesterId">The requester Id.</param>
+        /// <param name="leaseInterval">Interval for which the lease is taken on the resource protected by the mutex. 
+        /// If the lease is not renewed within this interval, it will cause it to expire and ownership of the resource 
+        /// will move to another instance.</param>
+        /// <returns>Returns true is the operation succeeds, false otherwise</returns>
+        public async Task<bool> RenewLeaseAsync(string requesterId, TimeSpan leaseInterval)
+        {
+            try
+            {
+                // Validate parameter
+                if (string.IsNullOrWhiteSpace(requesterId))
+                {
+                    throw new ArgumentNullException(nameof(requesterId), "requesterId argument cannot be null or empty.");
+                }
+
+                if (leaseInterval.TotalSeconds <= 0)
+                {
+                    throw new ArgumentException("leaseInterval cannot be less or equal to zero.", nameof(leaseInterval));
+                }
+
+                var result = await StateManager.TryGetStateAsync<string>(LeaderIdState);
+                DateTime now;
+                if (result.HasValue)
+                {
+                    if (!string.IsNullOrWhiteSpace(result.Value))
+                    {
+                        // The resource is already acquired.
+                        // Return true if requesterId == leaderId, false otherwise
+
+                        if (string.Compare(requesterId, result.Value, StringComparison.InvariantCultureIgnoreCase) == 0)
+                        {
+                            // Renew the lease. Add or update the leaseInterval and leaseDateTime states.
+                            now = DateTime.UtcNow;
+                            await StateManager.AddOrUpdateStateAsync(LeaseIntervalState, leaseInterval, (k, v) => leaseInterval);
+                            await StateManager.AddOrUpdateStateAsync(LeaseDateTimeState, now, (k, v) => now);
+
+                            // Register a one-shot reminder
+                            for (var i = 0; i < maxRetryCount; i++)
+                            {
+                                try
+                                {
+                                    await RegisterReminderAsync(ReleaseResourceMutexReminder,
+                                                                null,
+                                                                leaseInterval,
+                                                                TimeSpan.FromMilliseconds(-1));
+                                }
+                                catch (FabricTransientException)
+                                {
+                                }
+                            }
+
+                            ActorEventSource.Current.Message($"Operation succeeded. Resource=[{Id}] RequesterId=[{requesterId}] LeaderId=[{result.Value}]");
+                            return true;
+                        }
+
+                        // The resource mutex cannot be renewed by a requester other than the leader
+                        ActorEventSource.Current.Message($"Operation failed. Resource=[{Id}] RequesterId=[{requesterId}] LeaderId=[{result.Value}]");
+                        return false;
+                    }
+                }
+                
+                // If the value of the leaderId state is null, the renew operation acquires a lease on the resource
+                await StateManager.AddOrUpdateStateAsync(LeaderIdState, requesterId, (k, v) => requesterId);
+
+                // Add or update the leaseInterval and leaseDateTime states.
+                await StateManager.AddOrUpdateStateAsync(LeaseIntervalState, leaseInterval, (k, v) => leaseInterval);
+                now = DateTime.UtcNow;
+                await StateManager.AddOrUpdateStateAsync(LeaseDateTimeState, now, (k, v) => now);
+
+                // Register a one-shot reminder
+                for (var i = 0; i < maxRetryCount; i++)
+                {
+                    try
+                    {
+                        await RegisterReminderAsync(ReleaseResourceMutexReminder,
+                                                    null,
+                                                    leaseInterval,
+                                                    TimeSpan.FromMilliseconds(-1));
+                    }
+                    catch (FabricTransientException)
+                    {
+                    }
+                }
+
+                ActorEventSource.Current.Message($"Operation succeeded. Resource=[{Id}] RequesterId=[{requesterId}] LeaderId=[NULL]");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                ActorEventSource.Current.Error(ex);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Initiates an asynchronous operation to release the lease on 
+        /// a mutex that governs the exclusive access to a resource.
+        /// </summary>
+        /// <param name="requesterId">The requester Id.</param>
+        /// <returns>Returns true is the operation succeeds, false otherwise</returns>
+        public async Task<bool> ReleaseLeaseAsync(string requesterId)
+        {
+            try
+            {
+                // Validate parameter
+                if (string.IsNullOrWhiteSpace(requesterId))
+                {
+                    throw new ArgumentNullException(nameof(requesterId), "requesterId argument cannot be null or empty.");
+                }
+
+                var result = await StateManager.TryGetStateAsync<string>(LeaderIdState);
+                if (result.HasValue)
+                {
+                    if (!string.IsNullOrWhiteSpace(result.Value))
+                    {
+                        // The resource mutex is released only if the resource is  acquired by requesterId.
+                        if (string.Compare(requesterId, result.Value, StringComparison.InvariantCultureIgnoreCase) == 0)
+                        {
+                            // Remove all the states
+                            if (!await StateManager.TryRemoveStateAsync(LeaderIdState) ||
+                                !await StateManager.TryRemoveStateAsync(LeaseIntervalState) ||
+                                !await StateManager.TryRemoveStateAsync(LeaseDateTimeState))
+                            {
+                                return false;
+                            }
+
+                            // The resource mutex is released as the max retry count has been exhausted
+                            ActorEventSource.Current.Message($"Operation succeeded. Resource=[{Id}] RequesterId=[{requesterId}] LeaderId=[{result.Value}]");
+                            return true;
+                        }
+                        
+                        // The resource mutex cannot be released by another requester other than the leader
+                        ActorEventSource.Current.Message($"Operation failed. Resource=[{Id}] RequesterId=[{requesterId}] LeaderId=[{result.Value}]");
+                        return false;
+                    }
+                }
+
+                // The resource mutex cannot be released by another requester other than the leader
+                ActorEventSource.Current.Message($"Operation failed. Resource=[{Id}] RequesterId=[{requesterId}] LeaderId=[NULL]");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                ActorEventSource.Current.Error(ex);
+                throw;
+            }
+        }
+
+        #endregion
+
+        #region IRemindable Methods
+
+        public async Task ReceiveReminderAsync(string reminderName, byte[] context, TimeSpan dueTime, TimeSpan period)
+        {
+            try
+            {
+                var resultLeaderIdState = await StateManager.TryGetStateAsync<string>(LeaderIdState);
+                var resultLeaseIntervalState = await StateManager.TryGetStateAsync<TimeSpan>(LeaseIntervalState);
+                var resultLeaseDateTimeState = await StateManager.TryGetStateAsync<DateTime>(LeaseDateTimeState);
+                if (resultLeaderIdState.HasValue &&
+                    resultLeaseIntervalState.HasValue &&
+                    resultLeaseDateTimeState.HasValue)
+                {
+                    var leaderId = resultLeaderIdState.Value;
+                    var leaseInterval = resultLeaseIntervalState.Value;
+                    var leaseDateTime = resultLeaseDateTimeState.Value;
+                    
+                    if ((DateTime.UtcNow - leaseDateTime).TotalSeconds > leaseInterval.TotalSeconds)
+                    {
+                        // Remove all the states
+                        if (await StateManager.TryRemoveStateAsync(LeaderIdState) &&
+                            await StateManager.TryRemoveStateAsync(LeaseIntervalState) &&
+                            await StateManager.TryRemoveStateAsync(LeaseDateTimeState))
+                        {
+                            // The resource mutex is released as the max retry count has been exhausted
+                            ActorEventSource.Current.Message($"Resource Mutex Released. Resource=[{Id}] LeaderId=[{leaderId}].");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ActorEventSource.Current.Error(ex);
+            }
+        } 
+
+        #endregion
+    }
+}
+
+```
+The following table contains the code executed by both the stateless and stateful services inside the RunAsync method to acquire, renew and release the lease on the ResourceMutexActor.
+
+```CSharp
+protected override async Task RunAsync(CancellationToken cancellationToken)
+        {
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var actorProxy = ActorProxy.Create<IResourceMutexActor>(new ActorId(ResourceId),
+                                                                        new Uri(resourceMutextActorServiceUri));
+                if (actorProxy != null)
+                {
+                    // Create the requesterId
+                    var requesterId = $"{Context.ReplicaOrInstanceId}";
+
+                    var ok = await actorProxy.AcquireLeaseAsync(requesterId, leaseInterval);
+                    if (ok)
+                    {
+                        ServiceEventSource.Current.Message($"Requester [{requesterId}] acquired a lease on [{ResourceId}] acquired. StepCount=[{stepCount}]");
+                        for (var i = 0; i < stepCount; i++)
+                        {
+                            var step = i + 1;
+                            ServiceEventSource.Current.Message($"Requester [{requesterId}] is waiting [{renewInterval.Seconds}] seconds before renewing the lease on [{ResourceId}]. Step [{step}] of [{stepCount}]...");
+                            // Wait for time period equal to renewInterval parameter
+                            await Task.Delay(renewInterval, cancellationToken);
+
+                            // Renew the lease
+                            ServiceEventSource.Current.Message($"Requester [{requesterId}] renewing the lease on [{ResourceId}]. Step [{step}] of [{stepCount}]...");
+                            await actorProxy.RenewLeaseAsync(requesterId, leaseInterval);
+                            ServiceEventSource.Current.Message($"Requester [{requesterId}] successfully renewed the lease on [{ResourceId}]. Step [{step}] of [{stepCount}].");
+                        }
+
+                        // Simulate a down or mutex release
+                        var random = new Random();
+                        var value = random.Next(1, 3);
+                        if (value == 1)
+                        {
+                            // Simulate a down period
+                            ServiceEventSource.Current.Message($"Requester [{requesterId}] simulating a down of [{downInterval.Seconds}] seconds...");
+                            await Task.Delay(downInterval, cancellationToken);
+                        }
+                        else
+                        {
+                            // Release the mutex lease
+                            ServiceEventSource.Current.Message($"Requester [{requesterId}] releasing the lease on [{ResourceId}]...");
+                            await actorProxy.ReleaseLeaseAsync(requesterId);
+                            ServiceEventSource.Current.Message($"Requester [{requesterId}] successfully released the lease on [{ResourceId}]");
+                        }
+                    }
+                    
+                    // Wait before retrying to acquire the lease
+                    ServiceEventSource.Current.Message($"Requester [{requesterId}] is waiting [{acquireInterval.Seconds}] seconds before retrying to acquire a lease on [{ResourceId}]...");
+                    await Task.Delay(acquireInterval, cancellationToken);
+                }
+                else
+                {
+                    throw new ApplicationException($"The ActorProxy cannot be null. ResourceId=[{ResourceId}] ResourceMutextActorServiceUri=[{resourceMutextActorServiceUri}]");
+                }
+            }
+            // ReSharper disable once FunctionNeverReturns
+        }
+```
+
+# Configuration Files #
 
 **App.config** file in the **UserEmulator** project:
 
-```xml    
-    <?xml version="1.0" encoding="utf-8"?>
-    <configuration>
-		<appSettings>
-			<add key="url" value="http://localhost:8085/usersessions;
-                                  http://[NAME].[REGION].cloudapp.azure.com:8085/usersessions"/>
-			<add key="userCount" value="20"/>
-			<add key="eventInterval" value="2000"/>
-			<add key="eventsPerUserSession" value="50"/>
-		</appSettings>
-		<startup>
-			<supportedRuntime version="v4.0" sku=".NETFramework,Version=v4.5"/>
-		</startup>
-		<runtime>
-			<assemblyBinding xmlns="urn:schemas-microsoft-com:asm.v1">
-				<dependentAssembly>
-					<assemblyIdentity name="Newtonsoft.Json" publicKeyToken="30ad4fe6b2a6aeed" culture="neutral"/>
-					<bindingRedirect oldVersion="0.0.0.0-8.0.0.0" newVersion="8.0.0.0"/>
-				</dependentAssembly>
-			</assemblyBinding>
-		</runtime>
-    </configuration>
+```xml
+	<?xml version="1.0" encoding="utf-8" ?>
+	<configuration>
+	  <appSettings>
+		<add key="gatewayUrl" value="http://localhost:9015/"/>
+		<add key="stepCount" value="3" />
+		<add key="acquireIntervaladd" value="10" />
+		<add key="renewIntervaladd" value="10" />
+		<add key="leaseIntervaladd" value="30" />
+		<add key="downIntervaladd" value="45" />
+	  </appSettings>
+	  <startup> 
+		<supportedRuntime version="v4.0" sku=".NETFramework,Version=v4.5.2" />
+	  </startup>
+	</configuration>
 ```
 
 **ApplicationParameters\Local.xml** file in the **PageViewTracer** project:
@@ -151,43 +521,19 @@ This list contains the placeholders that need to be replaced before deploying an
 ```xml
 	<?xml version="1.0" encoding="utf-8"?>
 	<Application xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
-                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
-                 Name="fabric:/PageViewTracer" 
-                 xmlns="http://schemas.microsoft.com/2011/01/fabric">
-		<Parameters>
-			<Parameter Name="EventProcessorHostService_InstanceCount" 
-                       Value="1" />
-			<Parameter Name="EventProcessorHostService_StorageAccountConnectionString" 
-                       Value="[StorageAccountConnectionString]" />
-			<Parameter Name="EventProcessorHostService_ServiceBusConnectionString" 
-                       Value="[ServiceBusConnectionString]" />
-			<Parameter Name="EventProcessorHostService_EventHubName" 
-                       Value="[EventHubName]" />
-			<Parameter Name="EventProcessorHostService_ConsumerGroupName" 
-                       Value="[ConsumerGroupName]" />
-			<Parameter Name="EventProcessorHostService_ContainerName" 
-                       Value="[ContainerName]" />
-			<Parameter Name="EventProcessorHostService_QueueName" 
-                       Value="[QueueName]" />
-			<Parameter Name="EventProcessorHostService_MaxRetryCount" 
-                       Value="3" />
-			<Parameter Name="EventProcessorHostService_CheckpointCount" 
-                       Value="[CheckpointCount]" />
-			<Parameter Name="EventProcessorHostService_BackoffDelay" 
-                       Value="1" />
-			<Parameter Name="PageViewWebService_InstanceCount" 
-                       Value="1" />
-			<Parameter Name="PageViewWebService_ServiceBusConnectionString" 
-                       Value="[ServiceBusConnectionString]" />
-			<Parameter Name="PageViewWebService_EventHubName" 
-                       Value="[EventHubName]" />
-			<Parameter Name="PageViewWebService_EventHubClientNumber" 
-                       Value="[EventHubClientNumber]" />
-			<Parameter Name="PageViewWebService_MaxRetryCount" 
-                       Value="3" />
-			<Parameter Name="PageViewWebService_BackoffDelay" 
-                       Value="1" />
-		</Parameters>
+				 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+				 Name="fabric:/LeaderElection" 
+				 xmlns="http://schemas.microsoft.com/2011/01/fabric">
+	  <Parameters>
+	    <Parameter Name="GatewayService_InstanceCount" Value="1" />
+	    <Parameter Name="TestStatelessService_InstanceCount" Value="1" />
+	    <Parameter Name="TestStatefulService_PartitionCount" Value="1" />
+	    <Parameter Name="TestStatefulService_MinReplicaSetSize" Value="3" />
+	    <Parameter Name="TestStatefulService_TargetReplicaSetSize" Value="3" />
+	    <Parameter Name="ResourceMutexActorService_PartitionCount" Value="1" />
+	    <Parameter Name="ResourceMutexActorService_MinReplicaSetSize" Value="3" />
+	    <Parameter Name="ResourceMutexActorService_TargetReplicaSetSize" Value="3" />
+	  </Parameters>
 	</Application>
 ```
 
@@ -196,43 +542,19 @@ This list contains the placeholders that need to be replaced before deploying an
 ```xml
 	<?xml version="1.0" encoding="utf-8"?>
 	<Application xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
-                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
-                 Name="fabric:/PageViewTracer" 
-                 xmlns="http://schemas.microsoft.com/2011/01/fabric">
-		<Parameters>
-			<Parameter Name="EventProcessorHostService_InstanceCount" 
-                       Value="-1" />
-			<Parameter Name="EventProcessorHostService_StorageAccountConnectionString" 
-                       Value="[StorageAccountConnectionString]" />
-			<Parameter Name="EventProcessorHostService_ServiceBusConnectionString" 
-                       Value="[ServiceBusConnectionString]" />
-			<Parameter Name="EventProcessorHostService_EventHubName" 
-                       Value="[EventHubName]" />
-			<Parameter Name="EventProcessorHostService_ConsumerGroupName" 
-                       Value="[ConsumerGroupName]" />
-			<Parameter Name="EventProcessorHostService_ContainerName" 
-                       Value="[ContainerName]" />
-			<Parameter Name="EventProcessorHostService_QueueName" 
-                       Value="[QueueName]" />
-			<Parameter Name="EventProcessorHostService_MaxRetryCount" 
-                       Value="3" />
-			<Parameter Name="EventProcessorHostService_CheckpointCount" 
-                       Value="[CheckpointCount]" />
-			<Parameter Name="EventProcessorHostService_BackoffDelay" 
-                       Value="1" />
-			<Parameter Name="PageViewWebService_InstanceCount" 
-                       Value="-1" />
-			<Parameter Name="PageViewWebService_ServiceBusConnectionString" 
-                       Value="[ServiceBusConnectionString]" />
-			<Parameter Name="PageViewWebService_EventHubName" 
-                       Value="[EventHubName]" />
-			<Parameter Name="PageViewWebService_EventHubClientNumber" 
-                       Value="[EventHubClientNumber]" />
-			<Parameter Name="PageViewWebService_MaxRetryCount" 
-                       Value="3" />
-			<Parameter Name="PageViewWebService_BackoffDelay" 
-                       Value="1" />
-		</Parameters>
+				 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+				 Name="fabric:/LeaderElection" 
+				 xmlns="http://schemas.microsoft.com/2011/01/fabric">
+	  <Parameters>
+	    <Parameter Name="GatewayService_InstanceCount" Value="1" />
+	    <Parameter Name="TestStatelessService_InstanceCount" Value="1" />
+	    <Parameter Name="TestStatefulService_PartitionCount" Value="1" />
+	    <Parameter Name="TestStatefulService_MinReplicaSetSize" Value="3" />
+	    <Parameter Name="TestStatefulService_TargetReplicaSetSize" Value="3" />
+	    <Parameter Name="ResourceMutexActorService_PartitionCount" Value="1" />
+	    <Parameter Name="ResourceMutexActorService_MinReplicaSetSize" Value="3" />
+	    <Parameter Name="ResourceMutexActorService_TargetReplicaSetSize" Value="3" />
+	  </Parameters>
 	</Application>
 ```
 
@@ -240,94 +562,126 @@ This list contains the placeholders that need to be replaced before deploying an
 
 ```xml
     <?xml version="1.0" encoding="utf-8"?>
-    <ApplicationManifest xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
-                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
-                         ApplicationTypeName="PageViewTracerType" 
-                         ApplicationTypeVersion="1.0.1" 
-                         xmlns="http://schemas.microsoft.com/2011/01/fabric">
-		<Parameters>
-	      <Parameter Name="EventProcessorHostService_InstanceCount" DefaultValue="-1" />
-	      <Parameter Name="EventProcessorHostService_StorageAccountConnectionString" DefaultValue="" />
-	      <Parameter Name="EventProcessorHostService_ServiceBusConnectionString" DefaultValue="" />
-	      <Parameter Name="EventProcessorHostService_EventHubName" DefaultValue="" />
-	      <Parameter Name="EventProcessorHostService_ConsumerGroupName" DefaultValue="" />
-	      <Parameter Name="EventProcessorHostService_ContainerName" DefaultValue="usersessions" />
-	      <Parameter Name="EventProcessorHostService_QueueName" DefaultValue="usersessions" />
-	      <Parameter Name="EventProcessorHostService_MaxRetryCount" DefaultValue="3" />
-	      <Parameter Name="EventProcessorHostService_CheckpointCount" DefaultValue="100" />
-	      <Parameter Name="EventProcessorHostService_BackoffDelay" DefaultValue="1" />
-	      <Parameter Name="PageViewWebService_InstanceCount" DefaultValue="-1" />
-	      <Parameter Name="PageViewWebService_ServiceBusConnectionString" DefaultValue="" />
-	      <Parameter Name="PageViewWebService_EventHubName" DefaultValue="" />
-	      <Parameter Name="PageViewWebService_EventHubClientNumber" DefaultValue="32" />
-	      <Parameter Name="PageViewWebService_MaxRetryCount" DefaultValue="3" />
-	      <Parameter Name="PageViewWebService_BackoffDelay" DefaultValue="1" />
-		</Parameters>
-		<ServiceManifestImport>
-      		<ServiceManifestRef ServiceManifestName="EventProcessorHostServicePkg" 
-                                ServiceManifestVersion="1.0.0" />
-			<ConfigOverrides>
-			<ConfigOverride Name="Config">
-				    <Settings>
-						<Section Name="EventProcessorHostConfig">
-							<Parameter Name="StorageAccountConnectionString" 
-                                       Value="[EventProcessorHostService_StorageAccountConnectionString]" />
-							<Parameter Name="ServiceBusConnectionString" 
-                                       Value="[EventProcessorHostService_ServiceBusConnectionString]" />
-							<Parameter Name="EventHubName" 
-                                       Value="[EventProcessorHostService_EventHubName]" />
-							<Parameter Name="ConsumerGroupName" 
-                                       Value="[EventProcessorHostService_ConsumerGroupName]" />
-							<Parameter Name="ContainerName" 
-                                       Value="[EventProcessorHostService_ContainerName]" />
-							<Parameter Name="QueueName" 
-                                       Value="[EventProcessorHostService_QueueName]" />
-							<Parameter Name="CheckpointCount" 
-                                       Value="[EventProcessorHostService_CheckpointCount]" />
-							<Parameter Name="MaxRetryCount" 
-                                       Value="[EventProcessorHostService_MaxRetryCount]" />
-							<Parameter Name="BackoffDelay" 
-                                       Value="[EventProcessorHostService_BackoffDelay]" />
-						</Section>
-				    </Settings>
-				</ConfigOverride>
-			</ConfigOverrides>
-		</ServiceManifestImport>
-		<ServiceManifestImport>
-			<ServiceManifestRef ServiceManifestName="PageViewWebServicePkg" 
-                                ServiceManifestVersion="1.0.1" />
-			<ConfigOverrides>
-				<ConfigOverride Name="Config">
-					<Settings>
-						<Section Name="PageViewWebServiceConfig">
-							<Parameter Name="ServiceBusConnectionString" 
-                                       Value="[PageViewWebService_ServiceBusConnectionString]" />
-							<Parameter Name="EventHubName" 
-                                       Value="[PageViewWebService_EventHubName]" />
-							<Parameter Name="EventHubClientNumber" 
-                                       Value="[PageViewWebService_EventHubClientNumber]" />
-							<Parameter Name="MaxRetryCount" 
-                                       Value="[PageViewWebService_MaxRetryCount]" />
-							<Parameter Name="BackoffDelay" 
-                                       Value="[PageViewWebService_BackoffDelay]" />
-						</Section>
-					</Settings>
-				</ConfigOverride>
-			</ConfigOverrides>
-		</ServiceManifestImport>
-		<DefaultServices>
-			<Service Name="EventProcessorHostService">
-				<StatelessService ServiceTypeName="EventProcessorHostServiceType" 
-                                  InstanceCount="[EventProcessorHostService_InstanceCount]">
-					<SingletonPartition />
-				</StatelessService>
-			</Service>
-			<Service Name="PageViewWebService">
-				<StatelessService ServiceTypeName="PageViewWebServiceType" 
-                                  InstanceCount="[PageViewWebService_InstanceCount]">
-				<SingletonPartition />
-			</StatelessService>
-			</Service>
-		</DefaultServices>
+	<ApplicationManifest xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ApplicationTypeName="LeaderElectionType" ApplicationTypeVersion="1.0.0" xmlns="http://schemas.microsoft.com/2011/01/fabric">
+	  <Parameters>
+	    <Parameter Name="GatewayService_InstanceCount" DefaultValue="-1" />
+	    <Parameter Name="GatewayService_ResourceMutexActorServiceUri" DefaultValue="" />
+	    <Parameter Name="TestStatelessService_InstanceCount" DefaultValue="-1" />
+	    <Parameter Name="TestStatelessService_ResourceMutexActorServiceUri" DefaultValue="" />
+	    <Parameter Name="TestStatelessService_StepCount" DefaultValue="3" />
+	    <Parameter Name="TestStatelessService_AcquireIntervalParameter" DefaultValue="10" />
+	    <Parameter Name="TestStatelessService_RenewIntervalParameter" DefaultValue="10" />
+	    <Parameter Name="TestStatelessService_LeaseIntervalParameter" DefaultValue="30" />
+	    <Parameter Name="TestStatelessService_DownIntervalParameter" DefaultValue="45" />
+	    <Parameter Name="TestStatefulService_PartitionCount" DefaultValue="5" />
+	    <Parameter Name="TestStatefulService_MinReplicaSetSize" DefaultValue="3" />
+	    <Parameter Name="TestStatefulService_TargetReplicaSetSize" DefaultValue="3" />
+	    <Parameter Name="TestStatefulService_ResourceMutexActorServiceUri" DefaultValue="" />
+	    <Parameter Name="TestStatefulService_StepCount" DefaultValue="3" />
+	    <Parameter Name="TestStatefulService_AcquireIntervalParameter" DefaultValue="10" />
+	    <Parameter Name="TestStatefulService_RenewIntervalParameter" DefaultValue="10" />
+	    <Parameter Name="TestStatefulService_LeaseIntervalParameter" DefaultValue="30" />
+	    <Parameter Name="TestStatefulService_DownIntervalParameter" DefaultValue="45" />
+	    <Parameter Name="ResourceMutexActorService_PartitionCount" DefaultValue="5" />
+	    <Parameter Name="ResourceMutexActorService_MinReplicaSetSize" DefaultValue="3" />
+	    <Parameter Name="ResourceMutexActorService_TargetReplicaSetSize" DefaultValue="3" />
+	  </Parameters>
+	  <!-- Import the ServiceManifest from the ServicePackage. 
+		   The ServiceManifestName and ServiceManifestVersion 
+	       should match the Name and Version attributes of the 
+		   ServiceManifest element defined in the 
+	       ServiceManifest.xml file. -->
+	  <ServiceManifestImport>
+	    <ServiceManifestRef ServiceManifestName="ResourceMutexActorServicePkg" ServiceManifestVersion="1.0.0" />
+	    <ConfigOverrides />
+	  </ServiceManifestImport>
+	  <ServiceManifestImport>
+	    <ServiceManifestRef ServiceManifestName="GatewayServicePkg" ServiceManifestVersion="1.0.0" />
+	    <ConfigOverrides>
+	      <ConfigOverride Name="Config">
+	        <Settings>
+	          <Section Name="ServiceConfig">
+	            <Parameter Name="ResourceMutexActorServiceUri" 
+						   Value="[GatewayService_ResourceMutexActorServiceUri]" />
+	          </Section>
+	        </Settings>
+	      </ConfigOverride>
+	    </ConfigOverrides>
+	  </ServiceManifestImport>
+	  <ServiceManifestImport>
+	    <ServiceManifestRef ServiceManifestName="TestStatefulServicePkg" ServiceManifestVersion="1.0.0" />
+	    <ConfigOverrides>
+	      <ConfigOverride Name="Config">
+	        <Settings>
+	          <Section Name="ServiceConfig">
+	            <Parameter Name="ResourceMutexActorServiceUri" Value="[TestStatefulService_ResourceMutexActorServiceUri]" />
+	            <Parameter Name="StepCount" 
+						   Value="[TestStatefulService_StepCount]" />
+	            <Parameter Name="AcquireIntervalParameter" 
+						   Value="[TestStatefulService_AcquireIntervalParameter]" />
+	            <Parameter Name="RenewIntervalParameter" 
+						   Value="[TestStatefulService_RenewIntervalParameter]" />
+	            <Parameter Name="LeaseIntervalParameter" 
+						   Value="[TestStatefulService_LeaseIntervalParameter]" />
+	            <Parameter Name="DownIntervalParameter" 
+						   Value="[TestStatefulService_DownIntervalParameter]" />
+	          </Section>
+	        </Settings>
+	      </ConfigOverride>
+	    </ConfigOverrides>
+	  </ServiceManifestImport>
+	  <ServiceManifestImport>
+	    <ServiceManifestRef ServiceManifestName="TestStatelessServicePkg" ServiceManifestVersion="1.0.0" />
+	    <ConfigOverrides>
+	      <ConfigOverride Name="Config">
+	        <Settings>
+	          <Section Name="ServiceConfig">
+	            <Parameter Name="ResourceMutexActorServiceUri" Value="[TestStatelessService_ResourceMutexActorServiceUri]" />
+	            <Parameter Name="StepCount" Value="[TestStatelessService_StepCount]" />
+	            <Parameter Name="AcquireIntervalParameter" Value="[TestStatelessService_AcquireIntervalParameter]" />
+	            <Parameter Name="RenewIntervalParameter" 
+						   Value="[TestStatelessService_RenewIntervalParameter]" />
+	            <Parameter Name="LeaseIntervalParameter" 
+ 						   Value="[TestStatelessService_LeaseIntervalParameter]" />
+	            <Parameter Name="DownIntervalParameter" 
+						   Value="[TestStatelessService_DownIntervalParameter]" />
+	          </Section>
+	        </Settings>
+	      </ConfigOverride>
+	    </ConfigOverrides>
+	  </ServiceManifestImport>
+	  <DefaultServices>
+	    <!-- The section below creates instances of service types, when an instance of this 
+	         application type is created. You can also create one or more instances of service type using the 
+	         ServiceFabric PowerShell module.
+	         
+	         The attribute ServiceTypeName below must match the name defined in the imported ServiceManifest.xml file. -->
+	    <Service Name="GatewayService">
+	      <StatelessService ServiceTypeName="GatewayServiceType" InstanceCount="[GatewayService_InstanceCount]">
+	        <SingletonPartition />
+	      </StatelessService>
+	    </Service>
+	    <Service Name="TestStatefulService">
+	      <StatefulService ServiceTypeName="TestStatefulServiceType" 
+						   TargetReplicaSetSize="[TestStatefulService_TargetReplicaSetSize]"
+						   MinReplicaSetSize="[TestStatefulService_MinReplicaSetSize]">
+	        <UniformInt64Partition PartitionCount="[TestStatefulService_PartitionCount]" LowKey="-9223372036854775808" HighKey="9223372036854775807" />
+	      </StatefulService>
+	    </Service>
+	    <Service Name="TestStatelessService">
+	      <StatelessService ServiceTypeName="TestStatelessServiceType" 
+							InstanceCount="[TestStatelessService_InstanceCount]">
+	        <SingletonPartition />
+	      </StatelessService>
+	    </Service>
+	    <Service Name="ResourceMutexActorService" 
+				 GeneratedIdRef="a5b8e7b0-5a4b-4503-84ea-b6c490541180|Persisted">
+	      <StatefulService ServiceTypeName="ResourceMutexActorServiceType" 
+						   TargetReplicaSetSize="[ResourceMutexActorService_TargetReplicaSetSize]" 
+						   MinReplicaSetSize="[ResourceMutexActorService_MinReplicaSetSize]">
+	        <UniformInt64Partition PartitionCount="[ResourceMutexActorService_PartitionCount]" LowKey="-9223372036854775808" HighKey="9223372036854775807" />
+	      </StatefulService>
+	    </Service>
+	  </DefaultServices>
 	</ApplicationManifest>
 ```

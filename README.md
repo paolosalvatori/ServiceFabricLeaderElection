@@ -513,10 +513,10 @@ protected override async Task RunAsync(CancellationToken cancellationToken)
 	  <appSettings>
 		<add key="gatewayUrl" value="http://localhost:9015/"/>
 		<add key="stepCount" value="3" />
-		<add key="acquireIntervaladd" value="10" />
-		<add key="renewIntervaladd" value="10" />
-		<add key="leaseIntervaladd" value="30" />
-		<add key="downIntervaladd" value="45" />
+		<add key="acquireInterval" value="10" />
+		<add key="renewInterval" value="10" />
+		<add key="leaseInterval" value="30" />
+		<add key="downInterval" value="45" />
 	  </appSettings>
 	  <startup> 
 		<supportedRuntime version="v4.0" sku=".NETFramework,Version=v4.5.2" />
